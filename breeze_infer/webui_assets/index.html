@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Breeze TTS Console</title>
+  <link rel="stylesheet" href="/webui.css">
+  <script type="module" src="/webui.mjs"></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div><p class="eyebrow">LOCAL SPEECH STUDIO</p><h1>Breeze TTS</h1><p>Create speech, manage voices, and monitor the model from this server.</p></div>
+      <span id="modelBadge" class="badge">Connecting…</span>
+    </header>
+
+    <section class="panel" aria-labelledby="serverHeading">
+      <div class="section-head"><div><h2 id="serverHeading">Server &amp; model</h2><p class="muted">Status updates automatically.</p></div><button id="refreshButton" type="button" class="secondary">Refresh</button></div>
+      <div class="metrics">
+        <div><span class="metric-label">Model</span><strong id="modelStatus">Connecting…</strong></div>
+        <div><span class="metric-label">GPU</span><strong id="gpuDevice">Unavailable</strong></div>
+        <div><span class="metric-label">Process VRAM</span><strong id="processVram">Unavailable</strong></div>
+        <div><span class="metric-label">PyTorch VRAM</span><strong id="torchVram">Unavailable</strong></div>
+        <div><span class="metric-label">GPU free / total</span><strong id="gpuCapacity">Unavailable</strong></div>
+      </div>
+      <div class="actions"><button id="loadButton" type="button">Load model</button><button id="unloadButton" type="button" class="secondary">Unload model</button><span id="modelActionStatus" class="muted" role="status" aria-live="polite"></span></div>
+    </section>
+
+    <section class="panel" aria-labelledby="voiceHeading">
+      <div class="section-head"><div><h2 id="voiceHeading">Voice</h2><p class="muted">Choose a saved reference voice or design a new one with instructions.</p></div><button id="refreshVoicesButton" type="button" class="secondary">Refresh voices</button></div>
+      <div class="two-col"><label>Model<select id="modelSelect"></select></label><label>Voice<select id="voiceSelect"></select></label></div>
+
+      <details class="subpanel"><summary>Upload voice</summary>
+        <p class="muted">Provide one audio file or URL and its reference transcript. Preloading the cache can load an unloaded model.</p>
+        <div class="two-col"><label>Reference audio file<input id="voiceFile" type="file" accept="audio/*"></label><label>Reference audio URL<input id="voiceUrl" type="url" placeholder="https://example.com/voice.wav"></label></div>
+        <audio id="voicePreview" controls hidden></audio>
+        <div class="two-col"><label>STT server URL<input id="sttUrl" type="url" list="sttRecent" placeholder="http://host:5092/v1" autocomplete="url"></label><label>STT API key for this session<input id="sttKey" type="password" autocomplete="off" placeholder="Optional"></label></div>
+        <datalist id="sttRecent"></datalist>
+        <div class="actions"><button id="transcribeButton" type="button" class="secondary">Transcribe reference file</button><span id="transcribeStatus" role="status" aria-live="polite"></span></div>
+        <div class="two-col"><label>Voice name<input id="voiceName" type="text" maxlength="200" placeholder="Optional"></label><label class="checkline"><input id="preloadVoice" type="checkbox" checked>Preload voice cache</label></div>
+        <label>Reference transcript<textarea id="voiceTranscript" rows="3" placeholder="Words spoken in the reference audio"></textarea></label>
+        <div class="actions"><button id="uploadButton" type="button">Upload voice</button><span id="uploadStatus" role="status" aria-live="polite"></span></div>
+      </details>
+
+      <details class="subpanel"><summary>Manage selected voice</summary>
+        <p class="muted">Built-in voices are read-only. Changes to saved voices apply immediately.</p>
+        <div class="two-col"><label>Voice name<input id="manageName" type="text" maxlength="200"></label><label>Reference transcript<textarea id="manageTranscript" rows="3"></textarea></label></div>
+        <div class="actions"><button id="saveVoiceButton" type="button" class="secondary">Save changes</button><button id="deleteVoiceButton" type="button" class="danger">Delete voice</button><span id="manageStatus" role="status" aria-live="polite"></span></div>
+      </details>
+    </section>
+
+    <section class="panel" aria-labelledby="generateHeading">
+      <h2 id="generateHeading">Generate speech</h2>
+      <label>Text to synthesize<textarea id="speechText" rows="6" placeholder="Enter text to speak…"></textarea></label>
+      <label>Instructions <span class="muted">(optional)</span><textarea id="instructions" rows="2" placeholder="Speak warmly and slowly…"></textarea></label>
+      <div class="two-col"><label>CFG scale <span class="muted">(blank uses server default)</span><input id="guidanceScale" type="number" min="0.01" step="any" placeholder="Auto"></label><label>Seed <span class="muted">(optional)</span><input id="seed" type="number" step="1" placeholder="42"></label></div>
+      <div class="two-col"><label>Request mode<select id="requestMode"><option value="auto">Auto</option><option value="streaming">Streaming</option><option value="non-streaming">Non-streaming</option></select></label><label>Stream format<select id="streamFormat"><option value="default">Default</option><option value="sse">SSE</option><option value="audio">Audio</option></select></label></div>
+      <p id="modeHint" class="muted"></p>
+      <div class="actions"><button id="generateButton" type="button" class="primary">Generate speech</button><button id="stopButton" type="button" class="secondary" disabled>Stop</button><span id="generationStatus" role="status" aria-live="polite">Ready.</span></div>
+      <div class="result"><strong>Generated speech</strong><audio id="outputAudio" controls></audio><a id="downloadAudio" class="download disabled" aria-disabled="true">Download WAV</a></div>
+    </section>
+  </main>
+</body>
+</html>

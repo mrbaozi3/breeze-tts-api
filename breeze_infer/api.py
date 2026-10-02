@@ -52,6 +52,7 @@ from breeze_infer.runtime import (
 )
 from breeze_infer.templates import get_template, prepare_inputs
 from breeze_infer.text_chunks import estimate_speech_frames, split_text_to_fit
+from breeze_infer.webui import router as webui_router
 from models.continuation_streaming import (
     ContinuationContextError,
     ContinuationStreamingRuntime,
@@ -540,6 +541,7 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Breeze TTS API", lifespan=_lifespan)
+app.include_router(webui_router)
 
 
 @app.middleware("http")

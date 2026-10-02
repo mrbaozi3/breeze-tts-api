@@ -127,7 +127,11 @@ def _configure_fake_speech_state(monkeypatch, *, runtime_error: bool = False) ->
 
 
 def test_api_exposes_only_health_and_streaming_speech() -> None:
-    paths = {route.path for route in app.routes if route.path.startswith("/")}
+    paths = {
+        route.path
+        for route in app.routes
+        if getattr(route, "path", "").startswith("/")
+    }
 
     assert "/health" in paths
     assert "/v1/audio/speech" in paths
@@ -139,7 +143,11 @@ def test_api_exposes_only_health_and_streaming_speech() -> None:
 
 
 def test_model_lifecycle_internal_routes_are_aliases() -> None:
-    routes = {route.path: route.endpoint for route in app.routes}
+    routes = {
+        route.path: route.endpoint
+        for route in app.routes
+        if hasattr(route, "path") and hasattr(route, "endpoint")
+    }
 
     assert routes["/internal/model/load"] is routes["/v1/model/load"]
     assert routes["/internal/model/unload"] is routes["/v1/model/unload"]

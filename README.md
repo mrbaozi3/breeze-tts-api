@@ -89,6 +89,7 @@ python -m breeze_infer.api \
 
 Useful URLs:
 
+- `http://127.0.0.1:7860/` — built-in speech WebUI
 - `http://127.0.0.1:7860/docs` — interactive API documentation
 - `http://127.0.0.1:7860/health` — readiness and model state
 - `http://127.0.0.1:7860/metrics` — process/request metrics
@@ -134,10 +135,34 @@ BREEZE_WEIGHTS_FILE=Breeze-TTS-2-int8-hybrid.safetensors
 BREEZE_WEIGHTS_PATH=/models/custom.safetensors  # custom: no auto-download
 BREEZE_HYBRID_SCALE_MODE=bf16_compat            # production hybrid policy
 BREEZE_PROFILE_DIR=/data/profiles
+BREEZE_STT_BASE_URL=http://host.docker.internal:5092/v1
+BREEZE_STT_API_KEY=optional-secret
 NVIDIA_VISIBLE_DEVICES=0
 ```
 
 The model mount must be writable when automatic download is enabled.
+
+### Built-in WebUI and transcription
+
+Open `http://<docker-host>:7860/` for voice upload and management, reference
+audio transcription, speech generation with live playback and WAV download,
+and model load/unload controls with GPU memory status. The WebUI uses the
+same server for TTS. The model loads automatically at startup; speech requests
+and voice uploads with **Preload voice cache** can also load it after an unload.
+
+Set `BREEZE_STT_BASE_URL` to the default external OpenAI-compatible STT root
+or `/v1` URL. This address must be reachable **from inside the TTS container**.
+For another Compose service, use its service name and container port; for a
+host service, use a reachable host address such as `host.docker.internal` when
+that hostname is configured. The STT URL can also be changed in the WebUI.
+The optional `BREEZE_STT_API_KEY` is used only for the configured default URL
+and is never returned to the browser. A key entered in the WebUI applies to
+that transcription request only and is not saved. The browser keeps up to 20
+recent STT URLs, but no keys.
+
+Transcription sends only the selected reference file to the STT server. It
+uses the first model advertised by `/v1/models`, or `whisper-1` if discovery
+fails, and fills the reference transcript from `/v1/audio/transcriptions`.
 
 For the bundled ConvRot hybrid checkpoint, production explicitly pins
 `BREEZE_HYBRID_SCALE_MODE=bf16_compat`. It retains FP32 scale buffers required
@@ -319,6 +344,9 @@ to save it without loading the model.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /health` | Readiness and model state |
+| `GET /` | Built-in WebUI |
+| `GET /webui/config` | Public WebUI defaults (no secrets) |
+| `POST /webui/transcribe` | Relay a reference file to external STT |
 | `GET /docs` | Swagger UI |
 | `POST /v1/audio/speech` | Design, clone, or direct speech |
 | `POST /v1/audio/speech/continuation` | Append a complete text chunk to retained generation state |
