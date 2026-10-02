@@ -9,6 +9,7 @@ import gc
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -134,6 +135,41 @@ def _wav(pcm: bytes, sample_rate: int) -> bytes:
         + struct.pack("<I", len(pcm))
         + pcm
     )
+
+
+def _response_format(value: object, *, streaming: bool) -> str:
+    audio_format = str(value or "wav").lower()
+    if audio_format not in {"wav", "pcm", "mp3", "opus", "aac"}:
+        raise HTTPException(422, "Breeze supports response_format=wav, pcm, mp3, opus, or aac")
+    if streaming and audio_format not in {"wav", "pcm"}:
+        raise HTTPException(422, "Streaming supports response_format=wav or pcm")
+    return audio_format
+
+
+def _encode_audio_response(
+    pcm: bytes, sample_rate: int, audio_format: str
+) -> tuple[bytes, str, int]:
+    if audio_format == "wav":
+        return _wav(pcm, sample_rate), "audio/wav", sample_rate
+    if audio_format == "pcm":
+        return pcm, "audio/pcm", sample_rate
+
+    codec, container, media_type = {
+        "mp3": ("libmp3lame", "mp3", "audio/mpeg"),
+        "opus": ("libopus", "ogg", "audio/ogg"),
+        "aac": ("aac", "adts", "audio/aac"),
+    }[audio_format]
+    output_rate = 48_000 if audio_format == "opus" else sample_rate
+    command = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-f", "s16le", "-ar", str(sample_rate), "-ac", "1", "-i", "pipe:0",
+        "-c:a", codec, "-ar", str(output_rate), "-f", container, "pipe:1",
+    ]
+    result = subprocess.run(command, input=pcm, capture_output=True, check=False)
+    if result.returncode != 0 or not result.stdout:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"{audio_format} encoding failed: {detail or 'empty output'}")
+    return result.stdout, media_type, output_rate
 
 
 def _prompt_token_count(inputs: dict) -> int:
@@ -1178,14 +1214,14 @@ async def speech(request: Request):
         # Every prompt is constructed before sending a streaming response, so
         # invalid combinations cannot become truncated responses after headers.
         request_id = f"api-{uuid.uuid4().hex}"
-        response_format = str(form.get("response_format") or "wav").lower()
         stream_format = str(form.get("stream_format") or "audio").lower()
         if stream_format not in {"audio", "sse"}:
             raise HTTPException(422, "stream_format must be audio or sse")
         stream = _parse_stream(form.get("stream", False)) or stream_format == "sse"
         sample_rate = app.state.runtime.sample_rate
-        if response_format not in {"wav", "pcm"}:
-            raise HTTPException(422, "Breeze supports response_format=wav or pcm")
+        response_format = _response_format(
+            form.get("response_format"), streaming=stream
+        )
         if stream:
             app.state.metrics["streaming_total"] += 1
             app.state.metrics[
@@ -1432,6 +1468,9 @@ async def speech(request: Request):
         pcm = b"".join(chunks)
         if not pcm:
             raise RuntimeError("Breeze produced an empty audio response")
+        output, media_type, output_rate = _encode_audio_response(
+            pcm, sample_rate, response_format
+        )
         _record_successful_request(
             request_id=request_id,
             started=started,
@@ -1445,13 +1484,12 @@ async def speech(request: Request):
             chunks=len(chunks),
             internal_timings=internal_timings,
         )
-        output = _wav(pcm, sample_rate) if response_format == "wav" else pcm
         return Response(
             output,
-            media_type="audio/wav" if response_format == "wav" else "audio/pcm",
+            media_type=media_type,
             headers={
-                "X-Sample-Rate": str(sample_rate),
-                "X-Audio-Sample-Rate": str(sample_rate),
+                "X-Sample-Rate": str(output_rate),
+                "X-Audio-Sample-Rate": str(output_rate),
                 "X-Request-Id": request_id,
             },
         )
@@ -1600,13 +1638,13 @@ async def continuation_speech(request: Request):
             if ref_request.get("profile_id"):
                 app.state.profiles.save_codes(ref_request["profile_id"], codes)
 
-        response_format = str(form.get("response_format") or "wav").lower()
         stream_format = str(form.get("stream_format") or "audio").lower()
-        if response_format not in {"wav", "pcm"}:
-            raise HTTPException(422, "Breeze supports response_format=wav or pcm")
         if stream_format not in {"audio", "sse"}:
             raise HTTPException(422, "stream_format must be audio or sse")
         stream = _parse_stream(form.get("stream", False)) or stream_format == "sse"
+        response_format = _response_format(
+            form.get("response_format"), streaming=stream
+        )
         # Continuation owns the codec runtime. Use its rate for framing and
         # inserted PCM so the boundary bytes match the retained decoder output.
         sample_rate = app.state.continuations.runtime.sample_rate
@@ -1951,18 +1989,20 @@ async def continuation_speech(request: Request):
             raise RuntimeError("Breeze produced an empty audio response")
         chunks = ([segment_gap_pcm] if segment_gap_pcm else []) + generated_chunks
         pcm = b"".join(chunks)
+        output, media_type, output_rate = _encode_audio_response(
+            pcm, sample_rate, response_format
+        )
         record_success(
             pcm_bytes=len(pcm),
             first_audio_at=first_audio_at,
             chunks=len(generated_chunks),
         )
-        output = _wav(pcm, sample_rate) if response_format == "wav" else pcm
         return Response(
             output,
-            media_type="audio/wav" if response_format == "wav" else "audio/pcm",
+            media_type=media_type,
             headers={
-                "X-Sample-Rate": str(sample_rate),
-                "X-Audio-Sample-Rate": str(sample_rate),
+                "X-Sample-Rate": str(output_rate),
+                "X-Audio-Sample-Rate": str(output_rate),
                 "X-Request-Id": request_id,
                 "X-Continuation-Id": continuation_id,
                 "X-Continuation-Chunk-Index": str(chunk_index),

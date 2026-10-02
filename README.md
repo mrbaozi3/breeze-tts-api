@@ -213,6 +213,15 @@ Use `stream=true` for a streaming response. Raw streaming output is PCM; use
 the `X-Sample-Rate: 24000` and `X-Sample-Format: s16le` headers. Set
 `stream_format=sse` for server-sent audio chunk events.
 
+For a complete, non-streaming response, `response_format` accepts `wav`
+(default), `pcm`, `mp3`, `opus`, and `aac`. MP3 is returned as `audio/mpeg`,
+Opus in an Ogg container as `audio/ogg`, and ADTS AAC as `audio/aac`.
+The compressed formats require `ffmpeg` with MP3, Opus, and AAC encoders;
+the Docker image includes it. Opus output is 48 kHz, while the other formats
+use the model's sample rate. The `X-Sample-Rate` and `X-Audio-Sample-Rate`
+headers describe the returned audio. MP3, Opus, and AAC are available on
+non-streaming continuation responses as well; streaming remains WAV or PCM.
+
 ### Experimental stateful continuation
 
 Pass `continuation_id` to `POST /v1/audio/speech` to keep the Breeze backbone,

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import shutil
+import subprocess
 import time
 from types import SimpleNamespace
 
@@ -34,6 +36,15 @@ class _DisconnectRequest(_Request):
 
     async def is_disconnected(self) -> bool:
         return self.disconnected
+
+
+class _FormRequest(_Request):
+    def __init__(self, body: dict):
+        super().__init__(body)
+        self.headers = {"content-type": "multipart/form-data"}
+
+    async def form(self):
+        return self.body
 
 
 class _Profiles:
@@ -171,6 +182,91 @@ def test_standard_speech_endpoint_dispatches_continuation_id(configured) -> None
     assert first.headers["x-continuation-chunk-index"] == "0"
     assert second.headers["x-continuation-chunk-index"] == "1"
     assert app.state.continuations.session.successful_chunks == 2
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+                    reason="ffmpeg and ffprobe are required")
+@pytest.mark.parametrize(
+    ("audio_format", "media_type", "codec", "output_rate"),
+    [
+        ("mp3", "audio/mpeg", "mp3", 24_000),
+        ("opus", "audio/ogg", "opus", 48_000),
+        ("aac", "audio/aac", "aac", 24_000),
+    ],
+)
+def test_continuation_returns_decodable_compressed_audio(
+    configured, monkeypatch, audio_format, media_type, codec, output_rate
+) -> None:
+    monkeypatch.setattr(api_module, "_pcm16", lambda _audio: bytes(2400 * 2))
+
+    first = asyncio.run(continuation_speech(_Request(_payload(response_format=audio_format))))
+    second = asyncio.run(continuation_speech(
+        _Request(_payload(input="again", response_format=audio_format))
+    ))
+    for response in (first, second):
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_name,sample_rate,channels",
+             "-of", "json", "-i", "pipe:0"],
+            input=response.body, capture_output=True, check=True,
+        )
+        decoded = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "s16le", "pipe:1"],
+            input=response.body, capture_output=True, check=True,
+        )
+        assert response.media_type == media_type
+        assert response.headers["x-sample-rate"] == str(output_rate)
+        assert response.headers["x-audio-sample-rate"] == str(output_rate)
+        assert json.loads(probe.stdout)["streams"][0] == {
+            "codec_name": codec, "sample_rate": str(output_rate), "channels": 1,
+        }
+        assert decoded.stdout
+    assert second.headers["x-continuation-chunk-index"] == "1"
+    assert app.state.continuations.session.successful_chunks == 2
+
+
+def test_multipart_continuation_accepts_compressed_format() -> None:
+    response = asyncio.run(continuation_speech(
+        _FormRequest(_payload(response_format="mp3"))
+    ))
+    assert response.media_type == "audio/mpeg"
+    assert response.body
+
+
+def test_continuation_keeps_default_wav() -> None:
+    response = asyncio.run(continuation_speech(_Request(_payload(response_format=None))))
+    assert response.media_type == "audio/wav"
+    assert response.body.startswith(b"RIFF")
+
+
+def test_invalid_continuation_format_returns_422() -> None:
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(continuation_speech(_Request(_payload(response_format="flac"))))
+    assert error.value.status_code == 422
+    assert app.state.continuations.session is None
+
+
+@pytest.mark.parametrize("audio_format", ["mp3", "opus", "aac"])
+@pytest.mark.parametrize("stream_fields", [{"stream": True}, {"stream_format": "sse"}])
+def test_continuation_streaming_rejects_compressed_formats(audio_format, stream_fields) -> None:
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(continuation_speech(_Request(_payload(response_format=audio_format,
+                                                            **stream_fields))))
+    assert error.value.status_code == 422
+    assert app.state.continuations.session is None
+
+
+def test_continuation_encoder_failure_closes_session(configured, monkeypatch) -> None:
+    asyncio.run(continuation_speech(_Request(_payload())))
+    monkeypatch.setattr(
+        api_module.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=b"", stderr=b"encoder failed"),
+    )
+    with pytest.raises(HTTPException, match="mp3 encoding failed") as error:
+        asyncio.run(continuation_speech(_Request(_payload(input="again", response_format="mp3"))))
+    assert error.value.status_code == 500
+    assert configured.closed == ["one"]
+    assert app.state.continuations.session is None
+    assert not api_module._request_lock.locked()
 
 
 def test_different_id_replaces_idle_session(configured) -> None:

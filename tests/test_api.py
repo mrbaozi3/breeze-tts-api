@@ -5,6 +5,8 @@ import gc
 import inspect
 import json
 import logging
+import shutil
+import subprocess
 import threading
 import time
 import weakref
@@ -419,6 +421,104 @@ def test_pcm16_clips_and_encodes_little_endian() -> None:
     encoded = _pcm16(np.array([-2.0, 0.0, 2.0], dtype=np.float32))
 
     assert np.frombuffer(encoded, dtype="<i2").tolist() == [-32767, 0, 32767]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+                    reason="ffmpeg and ffprobe are required")
+@pytest.mark.parametrize(
+    ("audio_format", "media_type", "codec", "output_rate"),
+    [
+        ("mp3", "audio/mpeg", "mp3", 24_000),
+        ("opus", "audio/ogg", "opus", 48_000),
+        ("aac", "audio/aac", "aac", 24_000),
+    ],
+)
+def test_nonstreaming_speech_returns_decodable_compressed_audio(
+    monkeypatch, audio_format, media_type, codec, output_rate
+) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    monkeypatch.setattr(api_module, "_pcm16", lambda _audio: bytes(2400 * 2))
+
+    response = asyncio.run(
+        speech(_JsonRequest({"input": "hello", "response_format": audio_format}))
+    )
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_name,sample_rate,channels",
+         "-of", "json", "-i", "pipe:0"],
+        input=response.body, capture_output=True, check=True,
+    )
+    stream = json.loads(probe.stdout)["streams"][0]
+    decoded = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "s16le", "pipe:1"],
+        input=response.body, capture_output=True, check=True,
+    )
+
+    assert response.media_type == media_type
+    assert response.headers["x-sample-rate"] == str(output_rate)
+    assert response.headers["x-audio-sample-rate"] == str(output_rate)
+    assert stream == {"codec_name": codec, "sample_rate": str(output_rate), "channels": 1}
+    assert decoded.stdout
+
+
+@pytest.mark.parametrize("audio_format", ["wav", "pcm"])
+def test_nonstreaming_speech_keeps_existing_formats(monkeypatch, audio_format) -> None:
+    _configure_fake_speech_state(monkeypatch)
+    response = asyncio.run(
+        speech(_JsonRequest({"input": "hello", "response_format": audio_format}))
+    )
+
+    assert response.media_type == f"audio/{audio_format}"
+    assert response.headers["x-sample-rate"] == "24000"
+    if audio_format == "wav":
+        assert response.body.startswith(b"RIFF")
+    else:
+        assert response.body == _pcm16(np.array([0.25, -0.25], dtype=np.float32))
+
+
+def test_multipart_speech_accepts_compressed_format(monkeypatch) -> None:
+    _configure_fake_speech_state(monkeypatch)
+    response = asyncio.run(
+        speech(_FormRequest({"input": "hello", "response_format": "mp3"}))
+    )
+
+    assert response.media_type == "audio/mpeg"
+    assert response.body
+
+
+def test_invalid_speech_format_returns_422(monkeypatch) -> None:
+    _configure_fake_speech_state(monkeypatch)
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(speech(_JsonRequest({"input": "hello", "response_format": "flac"})))
+    assert error.value.status_code == 422
+
+
+@pytest.mark.parametrize("audio_format", ["mp3", "opus", "aac"])
+@pytest.mark.parametrize("stream_fields", [{"stream": True}, {"stream_format": "sse"}])
+def test_streaming_rejects_compressed_formats(monkeypatch, audio_format, stream_fields) -> None:
+    _configure_fake_speech_state(monkeypatch)
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(speech(_JsonRequest({"input": "hello", "response_format": audio_format,
+                                         **stream_fields})))
+    assert error.value.status_code == 422
+
+
+def test_speech_encoder_failure_is_not_recorded_as_success(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    monkeypatch.setattr(
+        api_module.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=b"", stderr=b"encoder failed"),
+    )
+    with pytest.raises(HTTPException, match="mp3 encoding failed") as error:
+        asyncio.run(speech(_JsonRequest({"input": "hello", "response_format": "mp3"})))
+
+    assert error.value.status_code == 500
+    assert app.state.metrics["requests_success"] == 0
+    assert app.state.metrics["requests_error"] == 1
+    assert not api_module._request_lock.locked()
 
 
 def test_model_load_and_unload_endpoints_manage_runtime(monkeypatch) -> None:
