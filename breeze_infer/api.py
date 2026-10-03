@@ -15,18 +15,20 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.request import urlopen
 
+import anyio
 import numpy as np
 import psutil
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
+from starlette.types import Receive, Scope, Send
 
 from breeze_infer.audio import encode_prompt_audio
 from breeze_infer.continuation import (
@@ -93,6 +95,32 @@ class ApiSettings:
 
 _settings: ApiSettings | None = None
 _request_lock = threading.Lock()
+
+
+class _InferenceStreamingResponse(StreamingResponse):
+    """Finish inference even when ASGI stops before the body is exhausted."""
+
+    def __init__(
+        self,
+        body: AsyncIterator[bytes],
+        finalize: Callable[[], Awaitable[None]],
+        **kwargs,
+    ) -> None:
+        super().__init__(body, **kwargs)
+        self._finalize = finalize
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette skips background tasks on send errors. A disconnect can
+            # also happen before the body generator starts, so its own finally
+            # block is not enough to release the request.
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self.body_iterator.aclose()
+                finally:
+                    await self._finalize()
 
 
 def _quiet_expected_torch_compile_warnings() -> None:
@@ -1073,6 +1101,7 @@ async def speech(request: Request):
     started = time.perf_counter()
     finish_guard = threading.Lock()
     finished = False
+    pending_cleanup: asyncio.Future[None] | None = None
 
     def finish_request() -> None:
         nonlocal finished
@@ -1080,11 +1109,17 @@ async def speech(request: Request):
             if finished:
                 return
             finished = True
-            if temp_path is not None:
-                temp_path.unlink(missing_ok=True)
-            _request_lock.release()
+            try:
+                if temp_path is not None:
+                    temp_path.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("Breeze reference upload cleanup failed")
+            finally:
+                _request_lock.release()
 
     async def finish_stream_background() -> None:
+        if pending_cleanup is not None:
+            await pending_cleanup
         finish_request()
 
     try:
@@ -1229,6 +1264,7 @@ async def speech(request: Request):
             ] += 1
 
             async def stream_body() -> AsyncIterator[bytes]:
+                nonlocal pending_cleanup
                 chunk_count = 0
                 pcm_bytes = 0
                 pending: bytes | None = None
@@ -1261,7 +1297,11 @@ async def speech(request: Request):
                             "Breeze streaming iterator cleanup failed"
                         )
                     finally:
-                        finish_request()
+                        try:
+                            finish_request()
+                        finally:
+                            if pending_cleanup is not None and not pending_cleanup.done():
+                                pending_cleanup.set_result(None)
 
                 async def watch_disconnect() -> None:
                     while not cancel_event.is_set():
@@ -1316,10 +1356,9 @@ async def speech(request: Request):
                                     # current CUDA call and observe this event.
                                     cancel_event.set()
                                     app.state.metrics["streaming_cancelled"] += 1
-                                    if next_chunk.done():
-                                        chunk_iterator.close()
-                                    else:
+                                    if not next_chunk.done():
                                         deferred_finish = True
+                                        pending_cleanup = asyncio.get_running_loop().create_future()
                                         next_chunk.add_done_callback(
                                             lambda task, iterator=chunk_iterator: finish_after_pending_next(
                                                 task, iterator
@@ -1363,10 +1402,16 @@ async def speech(request: Request):
                                     # the sample-rate headers describe it.
                                     yield item
                         finally:
-                            # A completed synchronous generator runs its
-                            # cleanup (including codec request teardown).
-                            if cancel_event.is_set() and next_chunk.done():
-                                chunk_iterator.close()
+                            # Close on send errors as well as disconnects;
+                            # a paused async response otherwise leaves the
+                            # synchronous codec iterator open.
+                            if not deferred_finish:
+                                try:
+                                    chunk_iterator.close()
+                                except Exception:
+                                    logger.exception(
+                                        "Breeze streaming iterator cleanup failed"
+                                    )
                         if cancel_event.is_set():
                             app.state.metrics["streaming_cancelled"] += 1
                             return
@@ -1428,8 +1473,9 @@ async def speech(request: Request):
 
             media = "text/event-stream" if stream_format == "sse" else "audio/pcm"
             handoff = True
-            return StreamingResponse(
+            return _InferenceStreamingResponse(
                 stream_body(),
+                finish_stream_background,
                 media_type=media,
                 headers={
                     "Cache-Control": "no-cache",
@@ -1536,6 +1582,7 @@ async def continuation_speech(request: Request):
     request_succeeded = False
     failure_status = "failed"
     handoff = False
+    pending_cleanup: asyncio.Future[None] | None = None
 
     def finish_request() -> None:
         nonlocal finished, lock_held
@@ -1559,6 +1606,8 @@ async def continuation_speech(request: Request):
                     lock_held = False
 
     async def finish_stream_background() -> None:
+        if pending_cleanup is not None:
+            await pending_cleanup
         finish_request()
 
     def release_request_lock() -> None:
@@ -1793,7 +1842,7 @@ async def continuation_speech(request: Request):
 
         if stream:
             async def stream_body() -> AsyncIterator[bytes]:
-                nonlocal failure_status
+                nonlocal failure_status, pending_cleanup
                 if not acquire_stream_lock():
                     failure_status = "failed"
                     finish_request()
@@ -1836,7 +1885,11 @@ async def continuation_speech(request: Request):
                             "Breeze continuation iterator cleanup failed"
                         )
                     finally:
-                        finish_request()
+                        try:
+                            finish_request()
+                        finally:
+                            if pending_cleanup is not None and not pending_cleanup.done():
+                                pending_cleanup.set_result(None)
 
                 async def watch_disconnect() -> None:
                     nonlocal disconnected, failure_status
@@ -1860,10 +1913,9 @@ async def continuation_speech(request: Request):
                         except asyncio.CancelledError:
                             failure_status = "cancelled"
                             cancel_event.set()
-                            if next_chunk.done():
-                                iterator.close()
-                            else:
+                            if not next_chunk.done():
                                 deferred_finish = True
+                                pending_cleanup = asyncio.get_running_loop().create_future()
                                 next_chunk.add_done_callback(
                                     lambda task, pending_iterator=iterator: finish_after_pending_next(
                                         task, pending_iterator
@@ -1950,7 +2002,12 @@ async def continuation_speech(request: Request):
                 finally:
                     cancel_event.set()
                     if not deferred_finish:
-                        iterator.close()
+                        try:
+                            iterator.close()
+                        except Exception:
+                            logger.exception(
+                                "Breeze continuation iterator cleanup failed"
+                            )
                     watcher.cancel()
                     with suppress(asyncio.CancelledError):
                         await watcher
@@ -1960,8 +2017,9 @@ async def continuation_speech(request: Request):
             media = "text/event-stream" if stream_format == "sse" else "audio/pcm"
             release_request_lock()
             handoff = True
-            return StreamingResponse(
+            return _InferenceStreamingResponse(
                 stream_body(),
+                finish_stream_background,
                 media_type=media,
                 headers={
                     "Cache-Control": "no-cache",

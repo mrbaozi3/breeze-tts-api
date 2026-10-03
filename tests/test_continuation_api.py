@@ -5,6 +5,7 @@ import base64
 import json
 import shutil
 import subprocess
+import threading
 import time
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ import numpy as np
 import pytest
 import torch
 from fastapi import HTTPException
+from starlette.requests import ClientDisconnect
 
 import breeze_infer.api as api_module
 from breeze_infer.api import app, continuation_speech, speech
@@ -350,6 +352,133 @@ def test_stream_releases_request_lock_but_retains_session() -> None:
     assert not api_module._request_lock.locked()
     assert app.state.continuations.session is not None
     assert app.state.continuations.session.in_flight is False
+
+
+def test_asgi_disconnect_before_continuation_body_closes_session(configured) -> None:
+    response = asyncio.run(
+        continuation_speech(_Request(_payload(stream=True, response_format="pcm")))
+    )
+    assert app.state.continuations.session.in_flight is True
+
+    async def exercise() -> None:
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(_message):
+            await asyncio.Event().wait()
+
+        await response(
+            {"type": "http", "asgi": {"spec_version": "2.3"}}, receive, send
+        )
+
+    asyncio.run(exercise())
+    assert configured.closed == ["one"]
+    assert app.state.continuations.session is None
+    assert not api_module._request_lock.locked()
+    assert asyncio.run(continuation_speech(_Request(_payload()))).body
+
+
+def test_asgi_continuation_send_error_closes_session(configured) -> None:
+    iterator_closed = threading.Event()
+
+    def chunks(_state, _inputs, **_kwargs):
+        try:
+            yield SimpleNamespace(audio=np.array([0.25], dtype=np.float32))
+            yield SimpleNamespace(audio=np.array([0.25], dtype=np.float32))
+        finally:
+            iterator_closed.set()
+
+    configured.iter_start = chunks
+    response = asyncio.run(
+        continuation_speech(_Request(_payload(stream=True, response_format="pcm")))
+    )
+
+    async def exercise() -> None:
+        async def receive():
+            await asyncio.Event().wait()
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                raise OSError("client disconnected")
+
+        with pytest.raises(ClientDisconnect):
+            await response(
+                {"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send
+            )
+
+    asyncio.run(exercise())
+    assert iterator_closed.is_set()
+    assert configured.closed == ["one"]
+    assert app.state.continuations.session is None
+    assert not api_module._request_lock.locked()
+
+
+def test_asgi_continuation_completion_retains_session(configured) -> None:
+    response = asyncio.run(
+        continuation_speech(_Request(_payload(stream=True, response_format="pcm")))
+    )
+    sent = []
+
+    async def exercise() -> None:
+        async def receive():
+            await asyncio.Event().wait()
+
+        async def send(message):
+            sent.append(message)
+
+        await response(
+            {"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send
+        )
+
+    asyncio.run(exercise())
+    assert any(message.get("body") for message in sent)
+    assert configured.closed == []
+    assert app.state.continuations.session.successful_chunks == 1
+    assert app.state.continuations.session.in_flight is False
+    assert not api_module._request_lock.locked()
+
+
+def test_asgi_continuation_disconnect_waits_for_model_step(configured) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_chunks(state, _inputs, **_kwargs):
+        yield SimpleNamespace(audio=np.array([0.25], dtype=np.float32))
+        entered.set()
+        release.wait(2)
+        state.chunk_index += 1
+
+    configured.iter_start = slow_chunks
+    response = asyncio.run(
+        continuation_speech(_Request(_payload(stream=True, response_format="pcm")))
+    )
+
+    async def exercise() -> None:
+        async def receive():
+            await asyncio.to_thread(entered.wait, 2)
+            return {"type": "http.disconnect"}
+
+        async def send(_message):
+            pass
+
+        task = asyncio.create_task(
+            response(
+                {"type": "http", "asgi": {"spec_version": "2.3"}}, receive, send
+            )
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            await asyncio.sleep(0.05)
+            assert not task.done()
+            assert api_module._request_lock.locked()
+        finally:
+            release.set()
+        await asyncio.wait_for(task, 2)
+
+    asyncio.run(exercise())
+    assert configured.closed == ["one"]
+    assert app.state.continuations.session is None
+    assert not api_module._request_lock.locked()
 
 
 def test_unstarted_stream_does_not_hold_lock_and_expires(configured) -> None:

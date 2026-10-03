@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import torch
 from fastapi import HTTPException
+from starlette.requests import ClientDisconnect
 
 from breeze_infer.api import (
     DEFAULT_CFG_SCALE,
@@ -851,6 +852,214 @@ def test_abandoned_stream_background_releases_inference_lock(monkeypatch) -> Non
     asyncio.run(response.background())
 
     assert not api_module._request_lock.locked()
+
+
+def test_asgi_disconnect_before_stream_body_releases_inference_lock(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    response = asyncio.run(speech(_JsonRequest({"input": "hello", "stream": True})))
+
+    async def exercise() -> None:
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(_message):
+            # Keep response.start pending so the disconnect wins before the
+            # body generator can start.
+            await asyncio.Event().wait()
+
+        await response(
+            {"type": "http", "asgi": {"spec_version": "2.3"}}, receive, send
+        )
+
+    asyncio.run(exercise())
+    assert not api_module._request_lock.locked()
+    assert asyncio.run(speech(_JsonRequest({"input": "again"}))).body
+
+
+@pytest.mark.parametrize("send_error", [OSError("disconnected"), RuntimeError("send failed")])
+def test_asgi_send_error_closes_stream_and_releases_lock(monkeypatch, send_error) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    iterator_closed = threading.Event()
+
+    class _TrackingRuntime:
+        fast_enabled = True
+        sample_rate = 24_000
+
+        def iter_audio_chunks(self, _inputs, *, request_id, seed=None, cancel_event=None):
+            try:
+                yield SimpleNamespace(audio=np.array([0.25], dtype=np.float32))
+                yield SimpleNamespace(audio=np.array([0.25], dtype=np.float32))
+            finally:
+                iterator_closed.set()
+
+    app.state.runtime = _TrackingRuntime()
+    response = asyncio.run(speech(_JsonRequest({"input": "hello", "stream": True})))
+
+    async def exercise() -> None:
+        async def receive():
+            await asyncio.Event().wait()
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                raise send_error
+
+        with pytest.raises((ClientDisconnect, RuntimeError)):
+            await response(
+                {"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send
+            )
+
+    asyncio.run(exercise())
+    assert iterator_closed.is_set()
+    assert not api_module._request_lock.locked()
+    assert asyncio.run(speech(_JsonRequest({"input": "again"}))).body
+
+
+def test_asgi_stream_completion_releases_lock(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    response = asyncio.run(speech(_JsonRequest({"input": "hello", "stream": True})))
+    sent = []
+
+    async def exercise() -> None:
+        async def receive():
+            await asyncio.Event().wait()
+
+        async def send(message):
+            sent.append(message)
+
+        await response(
+            {"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send
+        )
+
+    asyncio.run(exercise())
+    assert any(message.get("body") for message in sent)
+    assert not api_module._request_lock.locked()
+
+
+def test_asgi_disconnect_waits_for_inflight_model_step(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _SlowRuntime:
+        fast_enabled = True
+        sample_rate = 24_000
+
+        def iter_audio_chunks(self, _inputs, *, request_id, seed=None, cancel_event=None):
+            yield SimpleNamespace(audio=np.array([0.25], dtype=np.float32))
+            entered.set()
+            release.wait(2)
+
+    app.state.runtime = _SlowRuntime()
+    response = asyncio.run(speech(_JsonRequest({"input": "hello", "stream": True})))
+
+    async def exercise() -> None:
+        async def receive():
+            await asyncio.to_thread(entered.wait, 2)
+            return {"type": "http.disconnect"}
+
+        async def send(_message):
+            pass
+
+        task = asyncio.create_task(
+            response(
+                {"type": "http", "asgi": {"spec_version": "2.3"}}, receive, send
+            )
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            await asyncio.sleep(0.05)
+            assert not task.done()
+            assert api_module._request_lock.locked()
+        finally:
+            release.set()
+        await asyncio.wait_for(task, 2)
+
+    asyncio.run(exercise())
+    assert not api_module._request_lock.locked()
+
+
+def test_cancelled_reference_upload_releases_inference_lock(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    entered = asyncio.Event()
+
+    class _SlowUpload:
+        filename = "reference.wav"
+
+        async def read(self, _limit):
+            entered.set()
+            await asyncio.Event().wait()
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            speech(
+                _FormRequest(
+                    {"input": "hello", "ref_text": "reference", "ref_audio": _SlowUpload()}
+                )
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    assert not api_module._request_lock.locked()
+    assert asyncio.run(speech(_JsonRequest({"input": "again"}))).body
+
+
+def test_reference_cleanup_error_does_not_strand_inference_lock(
+    monkeypatch, tmp_path
+) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    monkeypatch.setattr(
+        api_module, "encode_prompt_audio", lambda *_args: torch.zeros((1, 1))
+    )
+    named_temporary_file = api_module.tempfile.NamedTemporaryFile
+    monkeypatch.setattr(
+        api_module.tempfile,
+        "NamedTemporaryFile",
+        lambda *args, **kwargs: named_temporary_file(*args, **kwargs, dir=tmp_path),
+    )
+    original_unlink = api_module.Path.unlink
+
+    def failing_unlink(path, *args, **kwargs):
+        if path.parent == tmp_path:
+            raise OSError("temporary file could not be removed")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(api_module.Path, "unlink", failing_unlink)
+
+    class _Upload:
+        filename = "reference.wav"
+
+        async def read(self, _limit):
+            return b"reference audio"
+
+    try:
+        response = asyncio.run(
+            speech(
+                _FormRequest(
+                    {"input": "hello", "ref_text": "reference", "ref_audio": _Upload()}
+                )
+            )
+        )
+        assert response.body
+        assert not api_module._request_lock.locked()
+    finally:
+        for path in tmp_path.iterdir():
+            original_unlink(path)
 
 
 def test_cancelled_stream_defers_generator_close_until_worker_finishes(
