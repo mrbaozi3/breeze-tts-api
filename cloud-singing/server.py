@@ -29,12 +29,12 @@ async def upload(file,dest):
             out.write(data)
     if n<100:raise HTTPException(400,'Audio upload is empty')
 @app.get('/health')
-def health():return {'ok':True,'service':'qq-cloud-singing','version':1,'mode':'on_demand','modelLoaded':False}
+def health():return {'ok':True,'service':'qq-cloud-singing','version':2,'mode':'on_demand','modelLoaded':False,'maxSeconds':60}
 @app.post('/v1/audio/cover')
 async def cover(source:UploadFile=File(...),reference:UploadFile=File(...),seconds:int=Form(30),stems:bool=Form(False),x_singing_key:str|None=Header(None)):
     global deadline,stage
     authorize(x_singing_key)
-    if not 5<=seconds<=30:raise HTTPException(400,'Expected 5..30 seconds')
+    if not 5<=seconds<=60:raise HTTPException(400,'Expected 5..60 seconds')
     if not lock.acquire(False):raise HTTPException(409,'Another cover is running')
     started=time.monotonic()
     deadline=started+540
