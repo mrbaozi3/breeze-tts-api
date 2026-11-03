@@ -22,4 +22,7 @@ jobs:
         with:
           context: cloud-singing
           push: true
+          provenance: false
+          sbom: false
+          outputs: type=image,oci-mediatypes=false
           tags: ${{ secrets.ACR_REGISTRY }}/breeze-tts/breeze-tts2-api:singing-20261103-v1
