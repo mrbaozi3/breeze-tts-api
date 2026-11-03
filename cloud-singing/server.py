@@ -5,7 +5,9 @@ from fastapi.responses import Response
 app=FastAPI(title='QQ Cloud Singing')
 lock=threading.Lock()
 deadline=0.0
+stage='idle'
 LIMIT=40*1024*1024
+class StageFailure(RuntimeError):pass
 def authorize(value):
     key=os.environ.get('SINGING_API_KEY','')
     if not key or not hmac.compare_digest(key,value or ''):raise HTTPException(401,'Unauthorized')
@@ -13,7 +15,11 @@ def run(args):
     remaining=deadline-time.monotonic() if deadline else 450
     if remaining<=0:raise subprocess.TimeoutExpired(args,0)
     result=subprocess.run([str(x) for x in args],capture_output=True,timeout=min(450,remaining))
-    if result.returncode:raise RuntimeError('Audio processing failed')
+    if result.returncode:
+        detail=result.stderr.decode('utf-8',errors='replace')[-3500:]
+        secret=os.environ.get('SINGING_API_KEY','')
+        if secret:detail=detail.replace(secret,'[redacted]')
+        raise StageFailure(detail)
 async def upload(file,dest):
     n=0
     with dest.open('xb') as out:
@@ -26,7 +32,7 @@ async def upload(file,dest):
 def health():return {'ok':True,'service':'qq-cloud-singing','version':1,'mode':'on_demand','modelLoaded':False}
 @app.post('/v1/audio/cover')
 async def cover(source:UploadFile=File(...),reference:UploadFile=File(...),seconds:int=Form(30),x_singing_key:str|None=Header(None)):
-    global deadline
+    global deadline,stage
     authorize(x_singing_key)
     if not 5<=seconds<=30:raise HTTPException(400,'Expected 5..30 seconds')
     if not lock.acquire(False):raise HTTPException(409,'Another cover is running')
@@ -36,18 +42,25 @@ async def cover(source:UploadFile=File(...),reference:UploadFile=File(...),secon
         with tempfile.TemporaryDirectory(prefix='qq-cover-') as temp:
             d=pathlib.Path(temp)
             await upload(source,d/'source.bin');await upload(reference,d/'reference.bin')
+            stage='decode_source'
             run(['ffmpeg','-v','error','-n','-i',d/'source.bin','-t',seconds,'-ar','44100','-ac','2',d/'source.wav'])
+            stage='decode_reference'
             run(['ffmpeg','-v','error','-n','-i',d/'reference.bin','-t','20','-ar','44100','-ac','1',d/'reference.wav'])
+            stage='separate'
             run([sys.executable,'/opt/singing/server.py','separate',d/'source.wav',d])
+            stage='load_checkpoint'
             from huggingface_hub import hf_hub_download
             ckpt=hf_hub_download('Plachta/Seed-VC','DiT_seed_v2_uvit_whisper_base_f0_44k_bigvgan_pruned_ft_ema_v2.pth',revision='257283f9f41585055e8f858fba4fd044e5caed6e',cache_dir='./checkpoints',local_files_only=True)
+            stage='convert'
             run([sys.executable,'inference.py','--source',d/'vocals.wav','--target',d/'reference.wav','--output',d/'converted','--checkpoint',ckpt,'--config','configs/presets/config_dit_mel_seed_uvit_whisper_base_f0_44k.yml','--diffusion-steps','50','--f0-condition','True','--auto-f0-adjust','False','--fp16','True'])
             converted=list((d/'converted').glob('*.wav'))
             if len(converted)!=1:raise RuntimeError('Missing converted audio')
+            stage='mix'
             run(['ffmpeg','-v','error','-n','-i',converted[0],'-i',d/'no_vocals.wav','-filter_complex','[0:a][1:a]amix=inputs=2:duration=shortest:normalize=0,alimiter=limit=0.95','-c:a','libmp3lame','-b:a','256k',d/'cover.mp3'])
             data=(d/'cover.mp3').read_bytes()
             return Response(data,media_type='audio/mpeg',headers={'X-Generation-Seconds':str(round(time.monotonic()-started,2)),'X-Content-SHA256':hashlib.sha256(data).hexdigest()})
     except HTTPException:raise
+    except StageFailure as e:raise HTTPException(502,{'stage':stage,'diagnostic':str(e)})
     except subprocess.TimeoutExpired:raise HTTPException(504,'Generation timeout; do not retry automatically')
     except Exception:raise HTTPException(502,'Generation failed; do not retry automatically')
     finally:lock.release()
