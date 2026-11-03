@@ -1,5 +1,5 @@
 """Authenticated, single-job, synchronous GPU cover endpoint. No idle jobs."""
-import hashlib,hmac,json,os,pathlib,subprocess,sys,tempfile,threading,time
+import hashlib,hmac,json,os,pathlib,subprocess,sys,tempfile,threading,time,io,zipfile
 from fastapi import FastAPI,File,Form,Header,HTTPException,UploadFile
 from fastapi.responses import Response
 app=FastAPI(title='QQ Cloud Singing')
@@ -31,7 +31,7 @@ async def upload(file,dest):
 @app.get('/health')
 def health():return {'ok':True,'service':'qq-cloud-singing','version':1,'mode':'on_demand','modelLoaded':False}
 @app.post('/v1/audio/cover')
-async def cover(source:UploadFile=File(...),reference:UploadFile=File(...),seconds:int=Form(30),x_singing_key:str|None=Header(None)):
+async def cover(source:UploadFile=File(...),reference:UploadFile=File(...),seconds:int=Form(30),stems:bool=Form(False),x_singing_key:str|None=Header(None)):
     global deadline,stage
     authorize(x_singing_key)
     if not 5<=seconds<=30:raise HTTPException(400,'Expected 5..30 seconds')
@@ -56,8 +56,14 @@ async def cover(source:UploadFile=File(...),reference:UploadFile=File(...),secon
             converted=list((d/'converted').glob('*.wav'))
             if len(converted)!=1:raise RuntimeError('Missing converted audio')
             stage='mix'
-            run(['ffmpeg','-v','error','-n','-i',converted[0],'-i',d/'no_vocals.wav','-filter_complex','[0:a][1:a]amix=inputs=2:duration=shortest,volume=2,alimiter=limit=0.95','-c:a','libmp3lame','-b:a','256k',d/'cover.mp3'])
+            mix='[0:a]highpass=f=95,equalizer=f=300:t=q:w=1:g=-2,equalizer=f=2800:t=q:w=1:g=3,volume=1.12,pan=stereo|c0=c0|c1=c0[v];[1:a]volume=0.28[b];[v][b]amix=inputs=2:duration=shortest,volume=2,alimiter=limit=0.88:level=false'
+            run(['ffmpeg','-v','error','-n','-i',converted[0],'-i',d/'no_vocals.wav','-filter_complex',mix,'-c:a','libmp3lame','-b:a','256k',d/'cover.mp3'])
             data=(d/'cover.mp3').read_bytes()
+            if stems:
+                bundle=io.BytesIO()
+                with zipfile.ZipFile(bundle,'w',zipfile.ZIP_DEFLATED,compresslevel=1) as z:
+                    z.write(d/'cover.mp3','cover.mp3');z.write(converted[0],'vocals.wav');z.write(d/'no_vocals.wav','backing.wav')
+                return Response(bundle.getvalue(),media_type='application/zip',headers={'X-Generation-Seconds':str(round(time.monotonic()-started,2))})
             return Response(data,media_type='audio/mpeg',headers={'X-Generation-Seconds':str(round(time.monotonic()-started,2)),'X-Content-SHA256':hashlib.sha256(data).hexdigest()})
     except HTTPException:raise
     except StageFailure as e:raise HTTPException(502,{'stage':stage,'diagnostic':str(e)})
