@@ -56,7 +56,7 @@ async def cover(source:UploadFile=File(...),reference:UploadFile=File(...),secon
             converted=list((d/'converted').glob('*.wav'))
             if len(converted)!=1:raise RuntimeError('Missing converted audio')
             stage='mix'
-            run(['ffmpeg','-v','error','-n','-i',converted[0],'-i',d/'no_vocals.wav','-filter_complex','[0:a][1:a]amix=inputs=2:duration=shortest:normalize=0,alimiter=limit=0.95','-c:a','libmp3lame','-b:a','256k',d/'cover.mp3'])
+            run(['ffmpeg','-v','error','-n','-i',converted[0],'-i',d/'no_vocals.wav','-filter_complex','[0:a][1:a]amix=inputs=2:duration=shortest,volume=2,alimiter=limit=0.95','-c:a','libmp3lame','-b:a','256k',d/'cover.mp3'])
             data=(d/'cover.mp3').read_bytes()
             return Response(data,media_type='audio/mpeg',headers={'X-Generation-Seconds':str(round(time.monotonic()-started,2)),'X-Content-SHA256':hashlib.sha256(data).hexdigest()})
     except HTTPException:raise
